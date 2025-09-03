@@ -1,270 +1,264 @@
-# path: src/utils/lexicon_loader.py
-"""
-Protected lexicon loader & validator for fairness auditing.
+r"""
+src/utils/lexicon_loader.py
 
 Purpose
 -------
-- Load a hierarchical JSON lexicon of protected attributes and stereotype markers.
-- Validate structure, normalise terms, and compile boundary-safe regex patterns.
-- Provide a simple matcher API for titles/tags and a CLI to emit an audit JSON.
-
-Key features
-------------
-- Word-boundary guarding: avoids substring false positives (e.g., "asian" != "caucasian").
-- Multi-word phrases supported (spaces -> \s+).
-- Wildcards supported: '*' -> '.*' (greedy, use sparingly).
-- Case-insensitive, Unicode-safe.
-- Duplicate and cross-namespace overlap detection (informational).
+Load, validate, and compile a protected-terms lexicon for fairness auditing.
+- Ignores top-level metadata keys (e.g., "_source_notes").
+- Validates that each subgroup is a list of strings (coercing a single string to [string]).
+- Supports "*" wildcard in terms (expanded to r"[\w\-]*").
+- Compiles boundary-aware regex patterns with Unicode + case-insensitive flags.
+- Provides an audit CLI to summarise coverage and write a JSON report.
 
 Inputs
 ------
-- JSON file (default: config/protected_terms.json) with a structure like:
-  {
-    "race_ethnicity": {"black": ["ebony", "afro", "black", "bbc"], ...},
-    "nationality": {"brazilian": ["brazil*", "brasileir*"], ...},
-    "gender": {...},
-    "sexuality": {...},
-    "age": {...},
-    "hair_color": {...},
-    "stereotype_terms": {...}
-  }
+- config/protected_terms.json  (default)
+- config/config.yaml           (for paths + reproducibility header)
 
-Outputs (via CLI)
------------------
-- reports/metrics/v0_lexicon_audit.json   # counts, duplicates, overlaps
+Outputs
+-------
+- When run with --audit:
+  reports/metrics/v0_lexicon_audit.json    (summary counts, sample patterns)
 
 Assumptions
 -----------
-- The lexicon is curated for the adult content domain and reviewed for harms.
-- We keep "genre/flag" terms (e.g., "hentai") but they can be flagged upstream.
+- Namespaces are dictionary keys grouping subgroups, e.g. "race_ethnicity": {"black": [...], ...}
+- Any top-level key starting with "_" is considered metadata and ignored.
 
-Failure modes
+Failure Modes
 -------------
-- Missing or malformed JSON -> raises FileNotFoundError / ValueError.
-- Empty namespaces or subgroups -> recorded in audit (not fatal).
+- Missing or malformed JSON -> ValueError with a clear message.
+- Non-list subgroup values -> coerced if string; otherwise skipped with a warning.
 
 Complexity
 ----------
-- O(T) to compile T terms; matching is O(T) per text (typically small constants).
+- O(N) in number of terms; compilation is linear in the number of patterns.
 
-Test notes
+Test Notes
 ----------
-- Run: python -m src.utils.lexicon_loader --audit
-- Verify JSON audit is created and console prints sane counts.
+- `python -m src.utils.lexicon_loader --audit` should print a header and write the audit JSON.
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import argparse
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Pattern, Tuple, Iterable, Any, Optional, DefaultDict
-from collections import defaultdict
+from typing import Dict, List, Any, Optional, Tuple
 
 from src.utils.config_loader import (
-    load_config,
+    load_config as load_project_config,
     ensure_directories,
     set_global_seed,
     pick_device,
     print_run_header,
 )
 
+META_PREFIXES = ("_",)  # ignore top-level keys that start with these
+DEFAULT_LEXICON_REL = "config/protected_terms.json"
 
-# ----------------------------- Helpers & types -----------------------------
+# Compile flags: case-insensitive + Unicode + DOTALL off (default)
+REGEX_FLAGS = re.IGNORECASE
 
-Namespace = str       # e.g., "race_ethnicity"
-Subgroup = str        # e.g., "black"
-Term = str
 
-@dataclass(frozen=True)
-class CompiledTerm:
-    raw: Term
-    pattern: Pattern[str]
+def _warn(msg: str) -> None:
+    print(f"[warn] {msg}")
+
+
+def _is_meta_key(key: str) -> bool:
+    return any(key.startswith(p) for p in META_PREFIXES)
+
+
+def _term_to_regex(term: str) -> str:
+    """
+    Turn a lexicon term into a safe regex fragment.
+    - Escape all regex metacharacters, then re-enable "*" wildcard:
+      "japan*" -> r"japan[\w\-]*"
+    """
+    # Escape first
+    esc = re.escape(term)
+    # Re-enable '*' as an alnum/hyphen word extension (Unicode word chars via \w)
+    esc = esc.replace(r"\*", r"[\w\-]*")
+    return esc
+
+
+def _wrap_boundary(pattern: str, boundary: str) -> str:
+    """
+    boundary in {"word", "edge", "none"}:
+      - "word": wrap with \b..\b  (Unicode-aware word boundaries in Python)
+      - "edge": similar to "word" but tolerant of punctuation edges (here same as "word")
+      - "none": no wrapping
+    """
+    if boundary == "none":
+        return pattern
+    if boundary in {"word", "edge"}:
+        return rf"\b(?:{pattern})\b"
+    _warn(f"Unknown boundary '{boundary}', defaulting to 'word'")
+    return rf"\b(?:{pattern})\b"
+
+
+@dataclass
+class CompiledGroup:
+    subgroup: str
+    terms: List[str] = field(default_factory=list)
+    patterns: List[re.Pattern] = field(default_factory=list)
+
+
+@dataclass
+class CompiledNamespace:
+    namespace: str
+    groups: Dict[str, CompiledGroup] = field(default_factory=dict)
 
 
 @dataclass
 class ProtectedLexicon:
-    terms: Dict[Namespace, Dict[Subgroup, List[Term]]]
-    patterns: Dict[Namespace, Dict[Subgroup, List[CompiledTerm]]]
+    """Structured and (optionally) compiled lexicon."""
+    raw: Dict[str, Dict[str, List[str]]]
+    compiled: Dict[str, CompiledNamespace] = field(default_factory=dict)
+
+    # ---------- factory & validators ----------
 
     @classmethod
     def from_json(cls, path: Path) -> "ProtectedLexicon":
         if not path.exists():
-            raise FileNotFoundError(f"Lexicon file not found: {path}")
+            raise FileNotFoundError(f"Lexicon JSON not found: {path}")
         with path.open("r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if not isinstance(raw, dict):
-            raise ValueError("Top-level lexicon JSON must be an object/dict.")
+            raw_any = json.load(f)
+        if not isinstance(raw_any, dict):
+            raise ValueError("Lexicon JSON must be an object mapping namespaces to subgroup lists.")
 
-        # Ensure nesting is dict -> dict -> list[str]
-        for ns, groups in raw.items():
+        parsed: Dict[str, Dict[str, List[str]]] = {}
+        for ns, groups in raw_any.items():
+            if _is_meta_key(ns):
+                # skip metadata blocks like "_source_notes"
+                continue
             if not isinstance(groups, dict):
-                raise ValueError(f"Namespace '{ns}' must map to an object of subgroups.")
+                _warn(f"Namespace '{ns}' should be an object; skipping.")
+                continue
+            bucket: Dict[str, List[str]] = {}
             for sg, terms in groups.items():
-                if not isinstance(terms, list) or not all(isinstance(t, str) for t in terms):
-                    raise ValueError(f"Subgroup '{ns}.{sg}' must be a list of strings.")
-        return cls(terms=raw, patterns=defaultdict(dict))  # type: ignore[assignment]
+                # allow string -> [string]; skip non-list/dict
+                if isinstance(terms, str):
+                    bucket[sg] = [terms]
+                elif isinstance(terms, list):
+                    # ensure they are strings
+                    bad = [t for t in terms if not isinstance(t, str)]
+                    if bad:
+                        _warn(f"Namespace '{ns}.{sg}' contains non-string terms; filtering them out.")
+                    bucket[sg] = [str(t) for t in terms if isinstance(t, str)]
+                else:
+                    _warn(f"Subgroup '{ns}.{sg}' is not a list/string; skipping.")
+                    continue
+
+                # normalise terms (strip/unique, keep order)
+                seen = set()
+                normed: List[str] = []
+                for t in bucket[sg]:
+                    tt = t.strip()
+                    if not tt or tt.lower() in seen:
+                        continue
+                    seen.add(tt.lower())
+                    normed.append(tt)
+                bucket[sg] = normed
+            if bucket:
+                parsed[ns] = bucket
+
+        return cls(raw=parsed)
+
+    # ---------- compilation ----------
 
     def compile(self, boundary: str = "word") -> "ProtectedLexicon":
         """
-        Compile regex patterns for each term with boundary guards.
-
-        boundary: "word" -> \\b guards
-                  "edge" -> (?<!\\w)...(?!\\w) guards (safer on some unicode cases)
+        Compile all terms into regex patterns according to boundary strategy.
+        boundary: "word" (default), "edge", or "none".
         """
-        compiled: Dict[Namespace, Dict[Subgroup, List[CompiledTerm]]] = {}
-        for ns, groups in self.terms.items():
-            compiled[ns] = {}
-            for sg, term_list in groups.items():
-                uniq_terms = _dedupe_preserve(term_list)
-                compiled[ns][sg] = [CompiledTerm(raw=t, pattern=_compile_term(t, boundary)) for t in uniq_terms]
-        self.patterns = compiled
+        compiled: Dict[str, CompiledNamespace] = {}
+        for ns, groups in self.raw.items():
+            cns = CompiledNamespace(namespace=ns, groups={})
+            for sg, terms in groups.items():
+                pats: List[re.Pattern] = []
+                for t in terms:
+                    frag = _term_to_regex(t)
+                    patt = _wrap_boundary(frag, boundary=boundary)
+                    try:
+                        pats.append(re.compile(patt, REGEX_FLAGS))
+                    except re.error as e:
+                        _warn(f"Regex compile error in {ns}.{sg} for term '{t}': {e}. Skipping term.")
+                cns.groups[sg] = CompiledGroup(subgroup=sg, terms=terms, patterns=pats)
+            compiled[ns] = cns
+        self.compiled = compiled
         return self
 
-    def match_text(self, text: str) -> Dict[Tuple[Namespace, Subgroup], List[str]]:
+    # ---------- utilities ----------
+
+    def audit_summary(self, sample_n: int = 3) -> Dict[str, Any]:
         """
-        Return a mapping {(namespace, subgroup): [matched_terms...]} for the given text.
-        Duplicates removed per (ns, sg).
+        Produce a JSON-serialisable audit summary.
         """
-        hits: Dict[Tuple[Namespace, Subgroup], List[str]] = {}
-        if not text:
-            return hits
-        for ns, groups in self.patterns.items():
-            for sg, plist in groups.items():
-                matched: List[str] = []
-                for ct in plist:
-                    if ct.pattern.search(text):
-                        matched.append(ct.raw)
-                if matched:
-                    # dedupe to keep stable output
-                    hits[(ns, sg)] = _dedupe_preserve(matched)
-        return hits
-
-    def audit(self) -> Dict[str, Any]:
-        """
-        Basic counts + duplicates across namespaces/subgroups (by exact normalised term).
-        """
-        total_ns = len(self.terms)
-        total_sg = sum(len(g) for g in self.terms.values())
-        total_terms = 0
-
-        # Collect term -> list[(ns, sg)]
-        index: DefaultDict[str, List[Tuple[str, str]]] = defaultdict(list)
-        empty_groups: List[Tuple[str, str]] = []
-        for ns, groups in self.terms.items():
-            for sg, terms in groups.items():
-                if not terms:
-                    empty_groups.append((ns, sg))
-                for t in terms:
-                    norm = _normalise_term(t)
-                    index[norm].append((ns, sg))
-                    total_terms += 1
-
-        # Duplicates across multiple (ns, sg)
-        overlaps = {
-            term: pairs for term, pairs in index.items() if len(pairs) > 1
-        }
-
-        return {
-            "namespaces": total_ns,
-            "subgroups": total_sg,
-            "terms": total_terms,
-            "empty_groups": empty_groups,
-            "overlap_terms_count": len(overlaps),
-            "overlap_examples": dict(list(overlaps.items())[:50]),  # cap for readability
-        }
+        out: Dict[str, Any] = {"namespaces": {}, "totals": {"namespaces": 0, "subgroups": 0, "terms": 0}}
+        n_ns = n_sg = n_terms = 0
+        for ns, cns in self.compiled.items():
+            ns_terms = 0
+            groups_summary = {}
+            for sg, cg in cns.groups.items():
+                ns_terms += len(cg.terms)
+                groups_summary[sg] = {
+                    "terms_count": len(cg.terms),
+                    "sample_terms": cg.terms[:sample_n],
+                    "compiled_patterns": [p.pattern for p in cg.patterns[:sample_n]],
+                }
+            out["namespaces"][ns] = {
+                "subgroups": groups_summary,
+                "subgroup_count": len(cns.groups),
+                "terms_count": ns_terms,
+            }
+            n_ns += 1
+            n_sg += len(cns.groups)
+            n_terms += ns_terms
+        out["totals"]["namespaces"] = n_ns
+        out["totals"]["subgroups"] = n_sg
+        out["totals"]["terms"] = n_terms
+        return out
 
 
-# ----------------------------- Compilation utils -----------------------------
-
-_WORD_EDGE_LEFT = r"(?<!\w)"
-_WORD_EDGE_RIGHT = r"(?!\w)"
-
-def _normalise_term(t: str) -> str:
-    return t.strip().lower()
-
-def _escape_wildcards(term: str) -> str:
-    """
-    Escape regex special chars except '*' which we convert to '.*'
-    """
-    # First escape everything, then re-enable '*' wildcard
-    esc = re.escape(term)
-    esc = esc.replace(r"\*", ".*")
-    return esc
-
-def _compile_term(term: str, boundary: str = "word") -> Pattern[str]:
-    """
-    Build a robust regex:
-    - spaces -> \\s+ (handles multiple spaces or separators)
-    - '*' -> '.*' wildcard
-    - boundaries -> \\b or (?<!\\w) ... (?!\\w)
-    """
-    raw = _normalise_term(term)
-    # Replace spaces with \s+ (tolerant phrase matching)
-    raw = re.sub(r"\s+", r" ", raw)
-    esc = _escape_wildcards(raw)
-    esc = esc.replace(" ", r"\s+")
-    core = f"(?:{esc})"
-    if boundary == "edge":
-        pat = f"{_WORD_EDGE_LEFT}{core}{_WORD_EDGE_RIGHT}"
-    else:
-        # default 'word' boundary; may underperform with some unicode scripts
-        pat = rf"\b{core}\b"
-    return re.compile(pat, flags=re.IGNORECASE | re.UNICODE)
-
-
-def _dedupe_preserve(items: Iterable[str]) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for x in items:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-
-# ----------------------------- CLI & I/O -----------------------------
-
-def _load_or_fail(lex_path: Optional[Path]) -> ProtectedLexicon:
-    cfg = load_config()
-    default_path = Path(lex_path) if lex_path else cfg.paths.config_dir / "protected_terms.json"
-    lex = ProtectedLexicon.from_json(default_path).compile(boundary="edge")
-    return lex
-
-def _write_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
 
 def _cli(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Protected lexicon loader & audit")
-    parser.add_argument("--lexicon", type=str, default=None, help="Path to protected_terms.json (optional).")
-    parser.add_argument("--audit", action="store_true", help="Emit audit JSON to reports/metrics.")
-    parser.add_argument("--sample", type=str, default=None, help="Optional sample text to test matching.")
+    parser = argparse.ArgumentParser(description="Protected lexicon loader & auditor.")
+    parser.add_argument("--lexicon", type=str, default=None, help="Path to protected_terms.json")
+    parser.add_argument("--boundary", type=str, default="word", choices=["word", "edge", "none"],
+                        help="Regex boundary strategy.")
+    parser.add_argument("--audit", action="store_true", help="Print summary and write audit JSON.")
     args = parser.parse_args(argv)
 
-    cfg = load_config()
+    cfg = load_project_config()
     ensure_directories(cfg.paths)
     set_global_seed(cfg.random_seed, deterministic=True)
-    device_info = pick_device()
-    print_run_header(cfg, device_info, note="lexicon loader")
+    dev = pick_device()
+    print_run_header(cfg, dev, note="lexicon loader")
 
-    lex = _load_or_fail(Path(args.lexicon) if args.lexicon else None)
+    default_path = cfg.paths.root / DEFAULT_LEXICON_REL
+    path = Path(args.lexicon) if args.lexicon else default_path
+    if not path.exists():
+        raise FileNotFoundError(f"Lexicon file not found at {path}. Place it at config/protected_terms.json or pass --lexicon.")
 
-    # Sample test
-    if args.sample is not None:
-        hits = lex.match_text(args.sample)
-        print(f"[demo] sample text: {args.sample}")
-        for (ns, sg), terms in hits.items():
-            print(f"       hit: {ns}.{sg} <- {terms}")
+    # Load & compile
+    lex = ProtectedLexicon.from_json(path).compile(boundary=args.boundary)
 
     if args.audit:
-        audit = lex.audit()
-        out = cfg.paths.metrics / "v0_lexicon_audit.json"
-        _write_json(out, audit)
-        print(f"[ok] Wrote lexicon audit JSON → {out}")
-
+        audit = lex.audit_summary(sample_n=5)
+        metrics_dir = cfg.paths.metrics
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        out_json = metrics_dir / "v0_lexicon_audit.json"
+        with out_json.open("w", encoding="utf-8") as f:
+            json.dump(audit, f, indent=2, ensure_ascii=False)
+        print(f"[ok] Wrote lexicon audit → {out_json}")
+        # brief console summary
+        t = audit["totals"]
+        print(f"[ok] Namespaces={t['namespaces']}  Subgroups={t['subgroups']}  Terms={t['terms']}")
     return 0
 
 
