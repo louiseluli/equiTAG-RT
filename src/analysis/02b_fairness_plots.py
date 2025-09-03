@@ -27,9 +27,9 @@ python -m src.analysis.02b_fairness_plots \
 
 Notes
 -----
-- Figures use diverging palettes (coolwarm/RdBu) and categorical (tab20).
-- If a particular CSV is missing, it is silently skipped.
-- Uses project config for paths, so outputs align with the rest of the repo.
+- Uses only diverging palettes (coolwarm/RdBu) and categorical (tab20). No viridis.
+- Silently skips missing CSVs.
+- No constrained_layout or tight_layout to avoid warnings; we size and save with bbox_inches='tight'.
 """
 
 from __future__ import annotations
@@ -66,8 +66,7 @@ def _apply_theme(theme: str, dpi: int):
         "axes.titlesize": 13,
         "axes.labelsize": 11,
         "legend.frameon": False,
-        "figure.autolayout": False,  # use constrained layout instead
-        "figure.constrained_layout.use": True,
+        "figure.autolayout": False,           # avoid tight_layout auto
         "savefig.dpi": dpi,
     }
     if theme == "dark":
@@ -154,7 +153,7 @@ def _barh_diverging(ax, labels: List[str], values: np.ndarray, title: str, xlabe
     max_lab = max((len(s) for s in labels), default=0)
     fig = ax.figure
     w, h = fig.get_size_inches()
-    rec_w = max(w, min(18.0, 6.0 + 0.06 * max_lab))
+    rec_w = max(w, min(20.0, 6.0 + 0.065 * max_lab))
     if rec_w > w:
         fig.set_size_inches(rec_w, h, forward=True)
 
@@ -194,8 +193,13 @@ def plot_namespace_top_gaps(figdir: Path, model: str, namespace: str, df_ns: pd.
         if d.empty:
             continue
 
-        fig, ax = plt.subplots(constrained_layout=True, figsize=(10, max(4, 0.4*len(d))))
-        _barh_diverging(ax, d["label"].tolist(), d[m_col].values, 
+        # Size depends on number of bars
+        fig_h = max(4.0, 0.42 * len(d))
+        fig_w = 10.0
+        fig = plt.figure(figsize=(fig_w, fig_h))
+        ax = fig.add_subplot(111)
+
+        _barh_diverging(ax, d["label"].tolist(), d[m_col].values,
                         title=f"{namespace} — Top {len(d)} | {m_title} (model: {model})",
                         xlabel=m_title)
         # significance stars for p_adj (if present)
@@ -203,8 +207,13 @@ def plot_namespace_top_gaps(figdir: Path, model: str, namespace: str, df_ns: pd.
         xs = d[m_col].values
         ys = np.arange(len(d))
         _annotate_sig(ax, xs, ys, pvals, threshold=0.05)
+
+        # Slightly increase left margin for long labels (bbox_inches will handle most)
+        if d["label"].str.len().max() > 30:
+            fig.subplots_adjust(left=0.22)
+
         out = figdir / f"ns_top_gaps_{m_col}_{model}_{namespace}.png"
-        fig.savefig(out, dpi=dpi, bbox_inches="tight")
+        fig.savefig(out, dpi=dpi, bbox_inches="tight", pad_inches=0.1)
         plt.close(fig)
 
 def plot_namespace_engagement(figdir: Path, model: str, namespace: str, df_eng: pd.DataFrame, dpi: int):
@@ -216,14 +225,20 @@ def plot_namespace_engagement(figdir: Path, model: str, namespace: str, df_eng: 
     vals = d["delta_mean_log_views"].values
     pvals = d["p_log_views_adj"].values if "p_log_views_adj" in d.columns else None
 
-    fig, ax = plt.subplots(constrained_layout=True, figsize=(10, max(4, 0.4*len(d))))
-    _barh_diverging(ax, labels, vals, 
+    fig_h = max(4.0, 0.42 * len(d))
+    fig = plt.figure(figsize=(10.0, fig_h))
+    ax = fig.add_subplot(111)
+    _barh_diverging(ax, labels, vals,
                     title=f"{namespace} — Engagement Δ log(views) (model: {model})",
                     xlabel="Δ mean log(views) vs complement")
     xs = vals; ys = np.arange(len(vals))
     _annotate_sig(ax, xs, ys, pvals)
+
+    if d["subgroup"].str.len().max() > 30:
+        fig.subplots_adjust(left=0.22)
+
     out = figdir / f"ns_engagement_logviews_{model}_{namespace}.png"
-    fig.savefig(out, dpi=dpi, bbox_inches="tight")
+    fig.savefig(out, dpi=dpi, bbox_inches="tight", pad_inches=0.1)
     plt.close(fig)
 
 # -----------------------------
@@ -255,21 +270,36 @@ def plot_intersection_heatmaps(figdir: Path, model: str, combo_key: str, df_ix: 
             continue
         piv = (df_ix[df_ix["subgroup"].isin(cols_kept)]
                .pivot_table(index="class", columns="subgroup", values=m_col, aggfunc="mean"))
+
         # Order columns by max abs
+        if piv.size == 0:
+            continue
         order = np.argsort(np.nanmax(np.abs(piv.values), axis=0))[::-1]
         piv = piv.iloc[:, order]
         data = piv.values
         x_labels = [str(c) for c in piv.columns]
         y_labels = [str(r) for r in piv.index]
 
-        fig_w = min(18, 2 + 0.35*len(x_labels))
-        fig_h = min(10, 1 + 0.4*len(y_labels))
-        fig, ax = plt.subplots(constrained_layout=True, figsize=(fig_w, fig_h))
-        _heatmap(ax, data, x_labels, y_labels, 
+        # Figure sizing & margins (avoid constrained/tight layout)
+        fig_w = min(22, 2 + 0.35 * len(x_labels))
+        fig_h = min(12, 1 + 0.45 * len(y_labels))
+        fig = plt.figure(figsize=(fig_w, fig_h))
+        ax = fig.add_subplot(111)
+
+        _heatmap(ax, data, x_labels, y_labels,
                  title=f"{combo_key} — {m_title} (model: {model})",
                  vlabel=m_title)
+
+        # More bottom margin when many/long x tick labels
+        need_bottom = 0.14
+        if any(len(lbl) > 18 for lbl in x_labels):
+            need_bottom = max(need_bottom, 0.25)
+        if len(x_labels) > 14:
+            need_bottom = max(need_bottom, 0.28)
+        fig.subplots_adjust(bottom=need_bottom)
+
         out = figdir / f"ix_heatmap_{m_col}_{model}_{combo_key}.png"
-        fig.savefig(out, dpi=dpi, bbox_inches="tight")
+        fig.savefig(out, dpi=dpi, bbox_inches="tight", pad_inches=0.1)
         plt.close(fig)
 
 def plot_intersection_engagement(figdir: Path, model: str, combo_key: str, df_eng_ix: pd.DataFrame, top_n: int, dpi: int):
@@ -282,14 +312,21 @@ def plot_intersection_engagement(figdir: Path, model: str, combo_key: str, df_en
     vals = d["delta_mean_log_views"].values
     pvals = d["p_log_views_adj"].values if "p_log_views_adj" in d.columns else None
 
-    fig, ax = plt.subplots(constrained_layout=True, figsize=(12, max(4, 0.45*len(d))))
+    fig_h = max(4.0, 0.46 * len(d))
+    fig_w = min(22.0, 12.0 + 0.03 * max((len(s) for s in labels), default=0))
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    ax = fig.add_subplot(111)
     _barh_diverging(ax, labels, vals,
                     title=f"{combo_key} — Engagement Δ log(views) (model: {model})",
                     xlabel="Δ mean log(views) vs complement")
     xs = vals; ys = np.arange(len(vals))
     _annotate_sig(ax, xs, ys, pvals)
+
+    if max((len(s) for s in labels), default=0) > 35:
+        fig.subplots_adjust(left=0.22)
+
     out = figdir / f"ix_engagement_logviews_{model}_{combo_key}.png"
-    fig.savefig(out, dpi=dpi, bbox_inches="tight")
+    fig.savefig(out, dpi=dpi, bbox_inches="tight", pad_inches=0.1)
     plt.close(fig)
 
 # -----------------------------
