@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 src/analysis/02_fairness_eval.py
 
@@ -68,7 +70,6 @@ Notes
 
 from __future__ import annotations
 import argparse
-import csv
 import math
 import sqlite3
 from dataclasses import dataclass
@@ -284,7 +285,6 @@ def _two_prop_pvalue(k1: int, n1: int, k2: int, n2: int) -> float:
     if se == 0:
         return 1.0
     z = (p1 - p2) / se
-    # CDF via erf
     phi = 0.5 * (1 + math.erf(z / math.sqrt(2)))
     p_two = 2 * (1 - phi) if z >= 0 else 2 * phi
     return float(min(max(p_two, 0.0), 1.0))
@@ -312,12 +312,7 @@ def _welch_t_pvalue(m1, s1, n1, m2, s2, n2) -> float:
     if se == 0:
         return 1.0
     t = (m1 - m2) / se
-    # Welch-Satterthwaite dof
-    v = ((s1*s1)/n1 + (s2*s2)/n2)**2 / (
-        ((s1*s1)/n1)**2 / (n1 - 1) + ((s2*s2)/n2)**2 / (n2 - 1)
-    )
-    # approximate p from t using survival of Student's t:
-    # We'll approximate via normal if v is large; else fallback to normal too (OK for large n).
+    # approximate p via normal CDF (good for moderate/large dof)
     phi = 0.5 * (1 + math.erf(abs(t) / math.sqrt(2)))
     p_two = 2 * (1 - phi)
     return float(min(max(p_two, 0.0), 1.0))
@@ -407,7 +402,7 @@ def _attach_pvalues_and_adjust(tbl: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------
 
 def _engagement_stats(group_vids: Sequence[int], all_vids: Sequence[int], meta: pd.DataFrame) -> Dict[str, float]:
-    """Compute simple group vs complement differences on views/rating/ratings."""
+    """Compute group vs complement differences on views/rating/ratings, safely handling tiny Ns."""
     gset = set(int(v) for v in group_vids)
     aset = set(int(v) for v in all_vids)
     cset = aset - gset
@@ -421,23 +416,34 @@ def _engagement_stats(group_vids: Sequence[int], all_vids: Sequence[int], meta: 
             "mean_ratings_group": float("nan"), "mean_ratings_comp": float("nan"),
             "delta_mean_ratings": float("nan"),
         }
+
     m = meta.set_index("video_id")
     gv = m.loc[m.index.intersection(gset)]
     cv = m.loc[m.index.intersection(cset)]
+
     # log1p(views)
     glv = np.log1p(gv["views"].astype(float).values)
     clv = np.log1p(cv["views"].astype(float).values)
-    m1, s1, n1 = float(np.nanmean(glv)), float(np.nanstd(glv, ddof=1)), glv.size
-    m2, s2, n2 = float(np.nanmean(clv)), float(np.nanstd(clv, ddof=1)), clv.size
+    n1, n2 = glv.size, clv.size
+    m1 = float(np.nanmean(glv)) if n1 else float("nan")
+    m2 = float(np.nanmean(clv)) if n2 else float("nan")
+
+    # Only compute sample std with ddof=1 when n>1 to avoid warnings
+    s1 = float(np.nanstd(glv, ddof=1)) if n1 > 1 else 0.0
+    s2 = float(np.nanstd(clv, ddof=1)) if n2 > 1 else 0.0
     p_lv = _welch_t_pvalue(m1, s1, n1, m2, s2, n2)
+
     # rating (NaN allowed)
     r1 = gv["rating"].astype(float).values
     r2 = cv["rating"].astype(float).values
-    mr1, mr2 = float(np.nanmean(r1)), float(np.nanmean(r2))
+    mr1 = float(np.nanmean(r1)) if r1.size else float("nan")
+    mr2 = float(np.nanmean(r2)) if r2.size else float("nan")
+
     # ratings count
     rc1 = gv["ratings"].astype(float).values
     rc2 = cv["ratings"].astype(float).values
-    mrc1, mrc2 = float(np.nanmean(rc1)), float(np.nanmean(rc2))
+    mrc1 = float(np.nanmean(rc1)) if rc1.size else float("nan")
+    mrc2 = float(np.nanmean(rc2)) if rc2.size else float("nan")
 
     return {
         "n_group": int(n1), "n_comp": int(n2),
@@ -583,8 +589,7 @@ def main() -> int:
         # Engagement comparisons per subgroup (once per namespace)
         if ns not in engagement_ns_written:
             eng_rows = []
-            # Build group vids per subgroup (across all classes)
-            # We'll use membership mem over all vids.
+            # Build group vids per subgroup (across all vids)
             groups_vids: Dict[str, Set[int]] = {}
             for vid, nsmap in mem.items():
                 sgs = nsmap.get(ns, set())
@@ -596,10 +601,7 @@ def main() -> int:
             all_vids = meta_df["video_id"].tolist()
             for sg, vids_sg in groups_vids.items():
                 stats = _engagement_stats(vids_sg, all_vids, meta_df)
-                row = {
-                    "namespace": ns, "subgroup": sg,
-                    **stats
-                }
+                row = {"namespace": ns, "subgroup": sg, **stats}
                 tmp_rows.append(row)
                 pvals.append(row["p_log_views"])
             if tmp_rows:
@@ -680,24 +682,29 @@ def main() -> int:
         # Markdown pointer
         md_lines.append(f"- Details `{combo_key}`: `{out_ix}`\n")
 
-        # Compare intersections vs marginal subgroups (per constituent namespace)
+        # Compare intersections vs marginals (per constituent namespace)
         compare_rows = []
-        metrics_to_compare = [
-            ("dp_diff","pr_sub"),
-            ("eo_diff","tpr_sub"),
-            ("fpr_diff","fpr_sub"),
-        ]
-        # Build lookups for marginals
+        metrics_to_compare = [("dp_diff","pr_sub"), ("eo_diff","tpr_sub"), ("fpr_diff","fpr_sub")]
         lookups = {ns: ns_details.get(ns, pd.DataFrame()) for ns in combo}
-        for r in ix_tbl.itertuples(index=False):
-            # parse intersection label into dict
-            parts = [p.strip() for p in str(r.subgroup).split("&")]
+
+        # Use positional tuples to avoid issues with 'class' attribute names
+        cols = list(ix_tbl.columns)
+        i_combo = cols.index("combo")
+        i_class = cols.index("class")
+        i_subg  = cols.index("subgroup")
+
+        for row_vals in ix_tbl.itertuples(index=False, name=None):
+            cls = row_vals[i_class]
+            lab = row_vals[i_subg]
+
+            # parse "ns=sg & ns=sg [...]"
             ns_sg = {}
-            for p in parts:
+            for p in str(lab).split("&"):
+                p = p.strip()
                 if "=" in p:
-                    k,v = [x.strip() for x in p.split("=",1)]
+                    k, v = [x.strip() for x in p.split("=", 1)]
                     ns_sg[k] = v
-            # gather marginal rows for each constituent ns
+
             marg_vals = {}
             for ns in combo:
                 df_ = lookups.get(ns)
@@ -708,18 +715,16 @@ def main() -> int:
                 if sg is None:
                     marg_vals[ns] = None
                     continue
-                row = df_[(df_["class"] == r._1) & (df_["subgroup"] == sg)]  # r._1 is 'class' (first after combo)
-                if row.empty:
-                    marg_vals[ns] = None
-                else:
-                    marg_vals[ns] = row.iloc[0].to_dict()
-            # build long-form compare lines
+                row_m = df_[(df_["class"] == cls) & (df_["subgroup"] == sg)]
+                marg_vals[ns] = (None if row_m.empty else row_m.iloc[0].to_dict())
+
             for m_diff, m_rate in metrics_to_compare:
                 rec = {
-                    "combo": r.combo, "class": r._1, "intersection": r.subgroup,
+                    "combo": row_vals[i_combo], "class": cls, "intersection": lab,
                     "metric": m_diff,
-                    "intersection_value": getattr(r, m_diff, float("nan")),
-                    "intersection_rate": getattr(r, m_rate, float("nan")),
+                    # filled from current row tuple (robust against reserved names)
+                    "intersection_value": float(row_vals[cols.index(m_diff)]) if m_diff in cols else float("nan"),
+                    "intersection_rate":  float(row_vals[cols.index(m_rate)]) if m_rate in cols else float("nan"),
                 }
                 for ns in combo:
                     mv = marg_vals.get(ns)
@@ -739,15 +744,12 @@ def main() -> int:
                 index=False
             )
 
-        # Engagement for intersection groups (across all classes)
+        # Engagement for intersection groups (across all videos)
         eng_rows = []
         all_vids = meta_df["video_id"].tolist()
-        # Build mapping: intersection label -> set(video_id)
+
+        # Build mapping: intersection label -> set(video_id) using mem (deduped across classes)
         label2vids: Dict[str, Set[int]] = {}
-        for lab in ix_tbl["subgroup"].unique():
-            vids_lab = set(int(v) for v in ix_tbl[ix_tbl["subgroup"] == lab]["subgroup"].index)  # placeholder wrong, fix below
-        # Better: rebuild from mem to avoid duplication per class
-        # Parse mem and add all videos that match the intersection condition
         for vid, nsmap in mem.items():
             sets = []
             ok = True
@@ -762,6 +764,7 @@ def main() -> int:
             for items in product(*sets):
                 lab = " & ".join(f"{ns}={sg}" for ns, sg in zip(combo, items))
                 label2vids.setdefault(lab, set()).add(int(vid))
+
         # Compute stats + Holm adjust
         pvals = []
         tmp_rows = []
