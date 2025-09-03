@@ -71,7 +71,7 @@ def _is_meta_key(key: str) -> bool:
 
 
 def _term_to_regex(term: str) -> str:
-    """
+    r"""
     Turn a lexicon term into a safe regex fragment.
     - Escape all regex metacharacters, then re-enable "*" wildcard:
       "japan*" -> r"japan[\w\-]*"
@@ -84,7 +84,7 @@ def _term_to_regex(term: str) -> str:
 
 
 def _wrap_boundary(pattern: str, boundary: str) -> str:
-    """
+    r"""
     boundary in {"word", "edge", "none"}:
       - "word": wrap with \b..\b  (Unicode-aware word boundaries in Python)
       - "edge": similar to "word" but tolerant of punctuation edges (here same as "word")
