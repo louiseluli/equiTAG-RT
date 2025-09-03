@@ -1,0 +1,7 @@
+project_name: "equiTAG-RT"
+random_seed: 75
+paths:
+  database: "data/redtube_videos.db"
+  reports: "reports"
+  figures: "reports/figures"
+  metrics: "reports/metrics"

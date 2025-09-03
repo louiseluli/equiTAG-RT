@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Data & models
+data/*.db
+data/raw/
+models/
+reports/figures/
+reports/metrics/*.json
+reports/metrics/*.csv
+
+# OS/IDE
+.DS_Store
+.vscode/
+.idea/
