@@ -25,8 +25,9 @@ Additionally, we compute engagement comparisons (if available in DB):
 
 Inputs
 ------
-- Predictions (from baselines):
-  reports/metrics/baseline_v1/predictions_test_{lr|rf}.csv
+- Predictions:
+  reports/metrics/baseline_v1/predictions_test_{MODEL}.csv
+  (MODEL is any tag, e.g., lr, rf, lr_eo)
     columns: video_id, true_labels, pred_topk, pred_topk_probs
 - Labels summary:
   reports/metrics/baseline_v1/labels_summary.csv  (category,count)  -- class list
@@ -52,7 +53,7 @@ CLI
 ---
 Example:
 python -m src.analysis.02_fairness_eval \
-  --model lr \
+  --model lr_eo \
   --threshold 0.5 \
   --namespaces race_ethnicity gender sexuality nationality hair_color age \
   --intersections ALL2 ALL3 \
@@ -159,7 +160,7 @@ def _read_predictions(path: Path, classes: List[str], threshold: float) -> pd.Da
     df = pd.read_csv(path)
     df["video_id"] = df["video_id"].astype(int)
 
-    def _split_semicol(s: str) -> List[str]:
+    def _split_semicol(s):
         if isinstance(s, float) and math.isnan(s):
             return []
         s = str(s).strip()
@@ -312,7 +313,7 @@ def _welch_t_pvalue(m1, s1, n1, m2, s2, n2) -> float:
     if se == 0:
         return 1.0
     t = (m1 - m2) / se
-    # approximate p via normal CDF (good for moderate/large dof)
+    # approx via normal
     phi = 0.5 * (1 + math.erf(abs(t) / math.sqrt(2)))
     p_two = 2 * (1 - phi)
     return float(min(max(p_two, 0.0), 1.0))
@@ -324,8 +325,7 @@ def _welch_t_pvalue(m1, s1, n1, m2, s2, n2) -> float:
 def _per_group_counts(df_ns: pd.DataFrame) -> pd.DataFrame:
     """
     df_ns columns: ['video_id','subgroup','y_true','y_pred','in_group'] (bool)
-    Returns tidy table per subgroup after groupby with reset_index to avoid
-    'subgroup' being both index and column.
+    Returns tidy table per subgroup after groupby with reset_index.
     """
     grp = df_ns.groupby("subgroup", as_index=False)
 
@@ -461,7 +461,8 @@ def _engagement_stats(group_vids: Sequence[int], all_vids: Sequence[int], meta: 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fairness evaluation (DP/EO/FPR) per subgroup with Holm–Bonferroni, intersections, and engagement comparisons.")
-    ap.add_argument("--model", type=str, default="lr", choices=["lr","rf"], help="Which predictions file to use.")
+    ap.add_argument("--model", type=str, default="lr",
+                    help="Model tag; looks for reports/metrics/baseline_v1/predictions_test_{MODEL}.csv")
     ap.add_argument("--threshold", type=float, default=0.5, help="Threshold on top-k probabilities to set ŷ=1.")
     ap.add_argument("--namespaces", nargs="+",
                     default=["race_ethnicity","gender","sexuality","nationality","hair_color","age"],
@@ -512,7 +513,7 @@ def main() -> int:
     summary_rows: List[List] = []
     md_lines: List[str] = [
         "# Fairness Summary\n",
-        f"*Model:* **{args.model.upper()}**, *threshold:* **{args.threshold}**\n\n"
+        f"*Model:* **{args.model}**, *threshold:* **{args.threshold}**\n\n"
     ]
     ns_details: Dict[str, pd.DataFrame] = {}  # store to compare with intersections
     engagement_ns_written: Set[str] = set()
@@ -589,7 +590,7 @@ def main() -> int:
         # Engagement comparisons per subgroup (once per namespace)
         if ns not in engagement_ns_written:
             eng_rows = []
-            # Build group vids per subgroup (across all vids)
+            # Build group vids per subgroup (across all classes)
             groups_vids: Dict[str, Set[int]] = {}
             for vid, nsmap in mem.items():
                 sgs = nsmap.get(ns, set())
@@ -687,7 +688,6 @@ def main() -> int:
         metrics_to_compare = [("dp_diff","pr_sub"), ("eo_diff","tpr_sub"), ("fpr_diff","fpr_sub")]
         lookups = {ns: ns_details.get(ns, pd.DataFrame()) for ns in combo}
 
-        # Use positional tuples to avoid issues with 'class' attribute names
         cols = list(ix_tbl.columns)
         i_combo = cols.index("combo")
         i_class = cols.index("class")
@@ -722,7 +722,6 @@ def main() -> int:
                 rec = {
                     "combo": row_vals[i_combo], "class": cls, "intersection": lab,
                     "metric": m_diff,
-                    # filled from current row tuple (robust against reserved names)
                     "intersection_value": float(row_vals[cols.index(m_diff)]) if m_diff in cols else float("nan"),
                     "intersection_rate":  float(row_vals[cols.index(m_rate)]) if m_rate in cols else float("nan"),
                 }
@@ -744,11 +743,10 @@ def main() -> int:
                 index=False
             )
 
-        # Engagement for intersection groups (across all videos)
+        # Engagement for intersection groups (across all classes)
         eng_rows = []
         all_vids = meta_df["video_id"].tolist()
-
-        # Build mapping: intersection label -> set(video_id) using mem (deduped across classes)
+        # Build mapping: intersection label -> set(video_id) directly from mem
         label2vids: Dict[str, Set[int]] = {}
         for vid, nsmap in mem.items():
             sets = []
@@ -764,7 +762,6 @@ def main() -> int:
             for items in product(*sets):
                 lab = " & ".join(f"{ns}={sg}" for ns, sg in zip(combo, items))
                 label2vids.setdefault(lab, set()).add(int(vid))
-
         # Compute stats + Holm adjust
         pvals = []
         tmp_rows = []
