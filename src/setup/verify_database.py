@@ -43,21 +43,17 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
-import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Any, Tuple
 
-try:
-    import yaml  # pyyaml
-except ImportError:
-    print("Please install pyyaml (pip install pyyaml)", file=sys.stderr)
-    sys.exit(1)
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_FILE = PROJECT_ROOT / "config" / "config.yaml"
-METRICS_DIR = PROJECT_ROOT / "reports" / "metrics"
-
+from src.utils.config_loader import (
+    load_config as load_project_config,
+    ensure_directories,
+    set_global_seed,
+    pick_device,
+    print_run_header,
+)
 
 @dataclass
 class ColumnInfo:
@@ -83,14 +79,6 @@ class TableProfile:
     columns: List[ColumnInfo]
     indices: List[IndexInfo]
     foreign_keys: List[Dict[str, Any]]
-
-
-def load_config(cfg_path: Path) -> Dict[str, Any]:
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config not found: {cfg_path}")
-    with cfg_path.open("r") as f:
-        return yaml.safe_load(f)
-
 
 def connect_sqlite(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
@@ -164,9 +152,15 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--sample_n", type=int, default=100, help="Rows to sample for CSV.")
     args = parser.parse_args(argv)
 
-    cfg = load_config(CONFIG_FILE)
-    db_path = Path(args.db) if args.db else PROJECT_ROOT / cfg["paths"]["database"]
-    METRICS_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = load_project_config()
+    ensure_directories(cfg.paths)
+    set_global_seed(cfg.random_seed, deterministic=True)
+    device_info = pick_device()
+    print_run_header(cfg, device_info, note="database verification")
+
+    db_path = Path(args.db) if args.db else cfg.paths.database
+    metrics_dir = cfg.paths.metrics
+    metrics_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[info] Using DB: {db_path}")
 
@@ -197,7 +191,7 @@ def main(argv: List[str] | None = None) -> int:
 
     # 3) Sample CSV (videos + aggregated tags)
     sample_rows = sample_videos_with_tags(conn, n=args.sample_n)
-    csv_out = METRICS_DIR / "v0_sample_videos.csv"
+    csv_out = metrics_dir / "v0_sample_videos.csv"
     # Write with csv module to avoid pandas dependency
     import csv
     if sample_rows:
@@ -210,7 +204,7 @@ def main(argv: List[str] | None = None) -> int:
         print("[warn] No sample rows produced (empty videos table?).")
 
     # 4) JSON profile
-    json_out = METRICS_DIR / "v0_db_profile.json"
+    json_out = metrics_dir / "v0_db_profile.json"
     out_payload = {
         "database": str(db_path),
         "tables": to_json_serialisable(profile),
